@@ -1,23 +1,49 @@
 from typing import Dict, List, Annotated
 import numpy as np
 import os
+import faiss # Import the Faiss library
 
+# --- Global Constants ---
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
 DIMENSION = 70
 
 class VecDB:
+    """
+    A simple vector database implementation using NumPy memmap for storage 
+    and Faiss for efficient indexing and retrieval.
+    """
     def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index.dat", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
+        self.faiss_index = None # Attribute to hold the Faiss index
+        
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
-            # delete the old DB file if exists
+            
+            # Clean up old files
             if os.path.exists(self.db_path):
                 os.remove(self.db_path)
+            if os.path.exists(self.index_path):
+                os.remove(self.index_path)
+            
             self.generate_database(db_size)
-    
+        else:
+            # Load existing Faiss index
+            if os.path.exists(self.index_path):
+                try:
+                    self.faiss_index = faiss.read_index(self.index_path)
+                    print(f"Loaded Faiss index from {self.index_path}")
+                except Exception as e:
+                    print(f"Error loading Faiss index: {e}. Attempting to rebuild from data file.")
+                    self._build_index() # Rebuild if load fails
+            elif os.path.exists(self.db_path):
+                print("Index file not found. Building index from existing database file.")
+                self._build_index() # Build if index file is missing
+            else:
+                raise FileNotFoundError(f"Database file {self.db_path} not found. Cannot initialize existing DB.")
+
     def generate_database(self, size: int) -> None:
         rng = np.random.default_rng(DB_SEED_NUMBER)
         vectors = rng.random((size, DIMENSION), dtype=np.float32)
@@ -58,14 +84,31 @@ class VecDB:
         return np.array(vectors)
     
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k = 5):
+        """
+        Retrieves the top_k closest vectors (IDs) using the Faiss index.
+        This is much faster than the linear scan method.
+        """
+        if self.faiss_index is None:
+            print("Warning: Faiss index not available. Falling back to linear scan (very slow).")
+            return self._linear_retrieve(query, top_k)
+            
+        query = query.astype(np.float32).reshape(1, -1)
+        
+        faiss.normalize_L2(query)
+        
+        D, I = self.faiss_index.search(query, top_k) 
+        
+        return I[0].tolist()
+
+    def _linear_retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k = 5) -> List[int]:
+        """Original, slow linear scan retrieval for fallback."""
         scores = []
         num_records = self._get_num_records()
-        # here we assume that the row number is the ID of each vector
         for row_num in range(num_records):
             vector = self.get_one_row(row_num)
-            score = self._cal_score(query, vector)
+            score = self._cal_score(query.flatten(), vector) # Flatten query for dot product
             scores.append((score, row_num))
-        # here we assume that if two rows have the same score, return the lowest ID
+        
         scores = sorted(scores, reverse=True)[:top_k]
         return [s[1] for s in scores]
     
@@ -77,7 +120,25 @@ class VecDB:
         return cosine_similarity
 
     def _build_index(self):
-        # Placeholder for index building logic
-        pass
+        """Builds a Faiss IndexFlatIP (Inner Product) from all vectors in the DB."""
+        print("Building Faiss Index...")
+        
+        # Load all data (already normalized in generate_database/insert_records)
+        vectors = self.get_all_rows()
+        if vectors.size == 0:
+            print("No vectors found to build index. Index remains None.")
+            self.faiss_index = None
+            return
 
+        # Create IndexFlatIP (Inner Product)
+        # Suitable for Cosine Similarity because vectors are L2-normalized.
+        self.faiss_index = faiss.IndexFlatIP(DIMENSION)
 
+        # Add vectors to the index
+        self.faiss_index.add(vectors)
+        
+        # Save the index to disk
+        faiss.write_index(self.faiss_index, self.index_path)
+        print(f"Faiss Index built with {self.faiss_index.ntotal} vectors and saved to {self.index_path}")
+        
+   
