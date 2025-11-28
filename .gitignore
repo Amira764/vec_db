@@ -1,3 +1,6 @@
 OpenSubtitles_en_20M_emb_64.dat
 OpenSubtitles_en_20M_sorted.txt
 VecDB Design Document.pdf
+
+saved_db.dat
+index_ivf_index/
