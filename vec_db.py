@@ -82,6 +82,57 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
     
+    def get_rows_by_ids(self, ids: np.ndarray, max_block_size: int = 100_000) -> np.ndarray:
+        ids = np.asarray(ids, dtype=np.int64)
+        if ids.size == 0:
+            return np.empty((0, DIMENSION), dtype=np.float32)
+        order = np.argsort(ids)
+        ids_sorted = ids[order]
+
+        # Build list of contiguous ranges
+        ranges = []
+        s = int(ids_sorted[0])
+        prev = s
+        for x in ids_sorted[1:]:
+            x = int(x)
+            if x == prev + 1:
+                prev = x
+                continue
+            ranges.append((s, prev + 1))
+            s = x
+            prev = x
+        ranges.append((s, prev + 1))
+
+        # Open a single memmap for the DB once
+        num_records = self._get_num_records()
+        mmap_all = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
+
+        pieces = []
+        for (a, b) in ranges:
+            length = b - a
+            # If range is very large, chunk it to limit memory usage
+            if length <= max_block_size:
+                block = np.array(mmap_all[a:b], dtype=np.float32)
+                pieces.append(block)
+            else:
+                p = a
+                while p < b:
+                    q = min(b, p + max_block_size)
+                    pieces.append(np.array(mmap_all[p:q], dtype=np.float32))
+                    p = q
+
+        if len(pieces) == 0:
+            out_sorted = np.empty((0, DIMENSION), dtype=np.float32)
+        else:
+            out_sorted = np.vstack(pieces) 
+
+        # Map back to original order
+        out = np.empty((ids.size, DIMENSION), dtype=np.float32)
+        out[order] = out_sorted
+
+        return out
+
+
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
         nprobe = 66
         query = np.asarray(query, dtype=np.float32).reshape(DIMENSION)
@@ -97,32 +148,43 @@ class VecDB:
         nearest_centroids = np.argsort(sims_to_centroids)[::-1][:nprobe]
 
         # Get candidates from nearest centroids
-        heap = []
         lists_dir = os.path.join(self.index_path, "lists")
+        candidate_lists = []
         for cid in nearest_centroids:
             list_file = os.path.join(lists_dir, f"{cid:06d}.npy")
             if not os.path.exists(list_file):
                 continue
-            ids = np.load(list_file, mmap_mode='r') 
-            # Retrieve vectors and compute scores
-            for vid in ids:
-                vec = self.get_one_row(int(vid))
-                # Compute cosine
-                dot = float(np.dot(query, vec))
-                denom = qnorm * (np.linalg.norm(vec) if np.linalg.norm(vec) != 0 else 1.0)
-                score = dot / denom
-                # score = self._cal_score(query, vec)
-                if len(heap) < top_k:
-                    heappush(heap, (score, int(vid)))
-                else:
-                    # Replace smallest if current is larger
-                    if score > heap[0][0]:
-                        heappushpop(heap, (score, int(vid)))
+            ids = np.load(list_file, mmap_mode='r')
+            if ids.size == 0:
+                continue
+            candidate_lists.append(ids.astype(np.int64))
 
-        # return IDs sorted by score desc
-        results = sorted(heap, key=lambda x: x[0], reverse=True)
-        return [r[1] for r in results]
+        if len(candidate_lists) == 0:
+            return []
 
+        candidate_ids = np.concatenate(candidate_lists)
+        candidate_ids = np.unique(candidate_ids)
+
+        # # Retrieve vectors for candidates
+        candidate_vecs = self.get_rows_by_ids(candidate_ids)
+
+        # Compute scores
+        dots = candidate_vecs @ query                        
+        norms_cand = np.linalg.norm(candidate_vecs, axis=1) 
+        denom = norms_cand * qnorm
+        denom[denom == 0] = 1.0
+        scores = dots / denom
+
+        # Select top_k
+        if scores.size <= top_k:
+            top_idx = np.argsort(scores)[::-1]
+        else:
+            # Replace smallest if current is larger
+            part = np.argpartition(-scores, top_k - 1)[:top_k]
+            top_idx = part[np.argsort(scores[part])[::-1]]
+
+        top_ids = candidate_ids[top_idx]
+        return [int(x) for x in top_ids]
 
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
