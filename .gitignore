@@ -1,6 +1,21 @@
 OpenSubtitles_en_20M_emb_64.dat
+OpenSubtitles_en_1M_emb_64.dat
+OpenSubtitles_en_10M_emb_64.dat
+queries_emb_64.dat
+actual_sorted_ids_20m.dat
+Evaluate_ADB_Project.ipynb
 OpenSubtitles_en_20M_sorted.txt
 VecDB Design Document.pdf
 
 saved_db.dat
 index_ivf_index/
+vec_db/
+
+saved_ivf_pq_index_1M/
+saved_ivf_pq_index_10M/
+saved_ivf_pq_index_15M/
+saved_ivf_pq_index_20M/
+saved_index_1m/
+saved_index_10m/
+saved_index_20m/
+__pycache__/

@@ -6,12 +6,13 @@ from heapq import heappush, heappushpop
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
-DIMENSION = 70
+DIMENSION = 64
 
 class VecDB:
     def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index.dat", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
+        self._build_index()  # don't build automatically unless desired
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
@@ -34,7 +35,7 @@ class VecDB:
     def _get_num_records(self) -> int:
         return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
 
-    def insert_records(self, rows: Annotated[np.ndarray, (int, 70)]):
+    def insert_records(self, rows: Annotated[np.ndarray, (int, 64)]):
         num_old_records = self._get_num_records()
         num_new_records = len(rows)
         full_shape = (num_old_records + num_new_records, DIMENSION)
@@ -82,7 +83,7 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
     
-    def get_rows_by_ids(self, ids: np.ndarray, max_block_size: int = 100_000) -> np.ndarray:
+    def get_rows_by_ids(self, ids: np.ndarray, max_block_size: int = 1_000) -> np.ndarray:
         ids = np.asarray(ids, dtype=np.int64)
         if ids.size == 0:
             return np.empty((0, DIMENSION), dtype=np.float32)
@@ -133,58 +134,148 @@ class VecDB:
         return out
 
 
+    def _train_pq(self, sample_vectors: np.ndarray, M: int = 8, Ks: int = 256, niter: int = 20):
+        D = sample_vectors.shape[1]
+        if D % M != 0:
+            raise ValueError("DIMENSION must be divisible by M")
+        subdim = D // M
+        rng = np.random.default_rng(DB_SEED_NUMBER)
+
+        codebooks = np.zeros((M, Ks, subdim), dtype=np.float32)
+
+        for m in range(M):
+            sub = sample_vectors[:, m*subdim:(m+1)*subdim]
+            # initialize centroids by sampling
+            idx = rng.choice(len(sub), size=Ks, replace=False)
+            centroids = sub[idx].astype(np.float32).copy()
+
+            for it in range(niter):
+                dots = sub @ centroids.T                       # (S, Ks)
+                sub_sq = np.sum(sub*sub, axis=1, keepdims=True)   # (S,1)
+                cent_sq = np.sum(centroids*centroids, axis=1)     # (Ks,)
+                dists = sub_sq - 2.0 * dots + cent_sq[None, :]    # (S,Ks)
+                assign = np.argmin(dists, axis=1)
+                new_centroids = np.zeros_like(centroids)
+                counts = np.zeros((Ks,), dtype=np.int64)
+                for i, a in enumerate(assign):
+                    counts[a] += 1
+                    new_centroids[a] += sub[i]
+                for k in range(Ks):
+                    if counts[k] > 0:
+                        new_centroids[k] /= counts[k]
+                    else:
+                        new_centroids[k] = sub[rng.integers(0, len(sub))]
+                centroids = new_centroids
+            codebooks[m] = centroids
+        return codebooks.astype(np.float32)
+
+
+    def _encode_pq_codes_for_ids(self, ids: np.ndarray, codebooks: np.ndarray) -> np.ndarray:
+        """
+        Encode vectors for given ids into PQ codes (uint8).
+        Returns: codes array shape (len(ids), M), dtype=np.uint8
+        """
+        ids = np.asarray(ids, dtype=np.int64)
+        if ids.size == 0:
+            return np.empty((0, codebooks.shape[0]), dtype=np.uint8)
+
+        vecs = self.get_rows_by_ids(ids)   # (len(ids), DIM)
+        M, Ks, subdim = codebooks.shape
+        codes = np.empty((len(ids), M), dtype=np.uint8)
+
+        for m in range(M):
+            sub = vecs[:, m*subdim:(m+1)*subdim]   # (len(ids), subdim)
+            cent = codebooks[m]                    # (Ks, subdim)
+            dots = sub @ cent.T                    # (len(ids), Ks)
+            sub_sq = np.sum(sub*sub, axis=1, keepdims=True)   # (len(ids),1)
+            cent_sq = np.sum(cent*cent, axis=1)               # (Ks,)
+            dists = sub_sq - 2.0 * dots + cent_sq[None, :]    # (len(ids), Ks)
+            assign = np.argmin(dists, axis=1)
+            codes[:, m] = assign.astype(np.uint8)
+        return codes
+
+
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
-        nprobe = 66
-        query = np.asarray(query, dtype=np.float32).reshape(DIMENSION)
-        # load centroids
-        centroids_path = os.path.join(self.index_path, "centroids.npy")
-        centroids = np.load(centroids_path, mmap_mode='r') 
-        qnorm = np.linalg.norm(query)
+        if (self._get_num_records() / 1_000_000) <= 10:
+            nprobe = 2
+            rerank_k = 70
+        else:
+            nprobe = 99
+            rerank_k = 1300
+        index_dir = self.index_path
+        centroids = np.load(os.path.join(index_dir, "centroids.npy"))
+        pq_dir = os.path.join(index_dir, "pq")
+        codebooks_path = os.path.join(pq_dir, "pq_codebooks.npy")
+        if not os.path.exists(codebooks_path):
+            raise RuntimeError("PQ index not found")
+
+        # M is number of subquantizers, Ks is number of centroids per subquantizer, subdim is dimension / M
+        pq_codebooks = np.load(codebooks_path)
+        M, Ks, subdim = pq_codebooks.shape
+
+        q = np.asarray(query, dtype=np.float32).reshape(DIMENSION)
+        qnorm = np.linalg.norm(q)
         if qnorm == 0:
             qnorm = 1.0
+
+        # Choose centroids by cosine similarity
         cent_norms = np.linalg.norm(centroids, axis=1)
         cent_norms[cent_norms == 0] = 1.0
-        sims_to_centroids = (centroids @ query) / (cent_norms * qnorm)  
+        sims_to_centroids = (centroids @ q) / (cent_norms * qnorm)
         nearest_centroids = np.argsort(sims_to_centroids)[::-1][:nprobe]
 
-        # Get candidates from nearest centroids
-        lists_dir = os.path.join(self.index_path, "lists")
-        candidate_lists = []
+        lists_dir = os.path.join(index_dir, "lists")
+        codes_dir = os.path.join(pq_dir, "codes")
+        heap = []
+
+        # Measure distances using ADC (euclidean): ||q||² - 2 q·c + ||c||²
+        lut_local = np.empty((M, Ks), dtype=np.float32)
+        for m in range(M):
+            q_sub = q[m*subdim:(m+1)*subdim]
+            cent = pq_codebooks[m] 
+            q_sq = np.sum(q_sub * q_sub)
+            dots = cent @ q_sub     
+            cent_sq = np.sum(cent * cent, axis=1)
+            lut_local[m] = q_sq - 2.0 * dots + cent_sq
+
+        # Process each centroid's list
         for cid in nearest_centroids:
             list_file = os.path.join(lists_dir, f"{cid:06d}.npy")
-            if not os.path.exists(list_file):
-                continue
-            ids = np.load(list_file, mmap_mode='r')
-            if ids.size == 0:
-                continue
-            candidate_lists.append(ids.astype(np.int64))
+            codes_file = os.path.join(codes_dir, f"{cid:06d}_codes.npy")
 
-        if len(candidate_lists) == 0:
+            ids_mm = np.load(list_file)
+            codes_mm = np.load(codes_file)
+
+            # Compute approximate distances for the list
+            approx_dists = np.sum(lut_local[np.arange(M)[:,None], codes_mm.T], axis=0)
+
+            # Maintain top-n (rerank_k) in heap
+            for vid, dist in zip(ids_mm, approx_dists):
+                neg = -dist
+                if len(heap) < rerank_k:
+                    heappush(heap, (neg, int(vid)))
+                else:
+                    if neg > heap[0][0]:
+                        heappushpop(heap, (neg, int(vid)))
+
+        if not heap:
             return []
 
-        candidate_ids = np.concatenate(candidate_lists)
-        candidate_ids = np.unique(candidate_ids)
+        # Sort ids by distance ascending
+        heap_items = sorted([(-d, vid) for d, vid in heap], key=lambda x: x[0])
+        rerank_ids = np.array([vid for _, vid in heap_items], dtype=np.int64)
+        rerank_vecs = []
 
-        # # Retrieve vectors for candidates
-        candidate_vecs = self.get_rows_by_ids(candidate_ids)
+        # Get full vectors for rerank candidates
+        for x in rerank_ids:
+            rerank_vec = self.get_one_row(x)
+            # Compute cosine similarity
+            score = self._cal_score(q, rerank_vec)
+            rerank_vecs.append((score, x))
+        rerank_vecs.sort(key=lambda x: x[0], reverse=True)
+        top_ids = [int(t[1]) for t in rerank_vecs[:top_k]]
+        return top_ids
 
-        # Compute scores
-        dots = candidate_vecs @ query                        
-        norms_cand = np.linalg.norm(candidate_vecs, axis=1) 
-        denom = norms_cand * qnorm
-        denom[denom == 0] = 1.0
-        scores = dots / denom
-
-        # Select top_k
-        if scores.size <= top_k:
-            top_idx = np.argsort(scores)[::-1]
-        else:
-            # Replace smallest if current is larger
-            part = np.argpartition(-scores, top_k - 1)[:top_k]
-            top_idx = part[np.argsort(scores[part])[::-1]]
-
-        top_ids = candidate_ids[top_idx]
-        return [int(x) for x in top_ids]
 
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
@@ -222,7 +313,7 @@ class VecDB:
                 assignments[a].append(start + i)
 
         # Write index files
-        index_dir = os.path.splitext(self.index_path)[0] + "_ivf_index"
+        index_dir = os.path.splitext(self.index_path)[0]
         lists_dir = os.path.join(index_dir, "lists")
         os.makedirs(lists_dir, exist_ok=True)
         # Write centroids
@@ -230,12 +321,36 @@ class VecDB:
         meta = {"nlist": nlist, "dimension": DIMENSION, "element_size": ELEMENT_SIZE}
         with open(os.path.join(index_dir, "meta.json"), "w") as f:
             json.dump(meta, f)
-        # Write inverted lists
+        # Write inverted lists (IDs)
         for cid, id_list in enumerate(assignments):
             arr = np.array(id_list, dtype=np.uint32)
             np.save(os.path.join(lists_dir, f"{cid:06d}.npy"), arr)
 
+        # ------------------ PQ training & codes ------------------
+        # Tune these for your disk/index-size constraints:
+        # For 10M..20M rows, M=8 (8 bytes per vector) is typically required to fit 100-200MB indexes.
+        M = 8
+        Ks = 256
+        pq_codebooks = self._train_pq(sample_vectors, M=M, Ks=Ks, niter=12)
+
+        pq_dir = os.path.join(index_dir, "pq")
+        os.makedirs(pq_dir, exist_ok=True)
+        np.save(os.path.join(pq_dir, "pq_codebooks.npy"), pq_codebooks)
+        with open(os.path.join(pq_dir, "pq_meta.json"), "w") as f:
+            json.dump({"M": M, "Ks": Ks, "subdim": DIMENSION // M}, f)
+
+        codes_dir = os.path.join(pq_dir, "codes")
+        os.makedirs(codes_dir, exist_ok=True)
+        for cid, id_list in enumerate(assignments):
+            ids_arr = np.array(id_list, dtype=np.int64)
+            if ids_arr.size == 0:
+                np.save(os.path.join(codes_dir, f"{cid:06d}_codes.npy"), np.empty((0, M), dtype=np.uint8))
+                continue
+            codes = self._encode_pq_codes_for_ids(ids_arr, pq_codebooks)  # (len(ids), M)
+            np.save(os.path.join(codes_dir, f"{cid:06d}_codes.npy"), codes)
+
         # update index path pointer
+        print(f"Index built and saved to {index_dir}")
         self.index_path = index_dir
 
 
@@ -267,6 +382,3 @@ class VecDB:
                     new_centroids[k] = sample_vectors[rng.integers(0, len(sample_vectors))]
             centroids = new_centroids
         return centroids.astype(np.float32)
-
-
-
