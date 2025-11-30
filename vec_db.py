@@ -12,7 +12,7 @@ class VecDB:
     def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index.dat", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
-        self._build_index()  # don't build automatically unless desired
+        # self._build_index()  # For Building indexes one time
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
@@ -84,6 +84,7 @@ class VecDB:
         return np.array(vectors)
     
     def get_rows_by_ids(self, ids: np.ndarray, max_block_size: int = 1_000) -> np.ndarray:
+        # Retrieve multiple rows by their IDs.
         ids = np.asarray(ids, dtype=np.int64)
         if ids.size == 0:
             return np.empty((0, DIMENSION), dtype=np.float32)
@@ -145,15 +146,15 @@ class VecDB:
 
         for m in range(M):
             sub = sample_vectors[:, m*subdim:(m+1)*subdim]
-            # initialize centroids by sampling
+            # Initialize centroids by sampling
             idx = rng.choice(len(sub), size=Ks, replace=False)
             centroids = sub[idx].astype(np.float32).copy()
 
             for it in range(niter):
-                dots = sub @ centroids.T                       # (S, Ks)
-                sub_sq = np.sum(sub*sub, axis=1, keepdims=True)   # (S,1)
-                cent_sq = np.sum(centroids*centroids, axis=1)     # (Ks,)
-                dists = sub_sq - 2.0 * dots + cent_sq[None, :]    # (S,Ks)
+                dots = sub @ centroids.T                       
+                sub_sq = np.sum(sub*sub, axis=1, keepdims=True)   
+                cent_sq = np.sum(centroids*centroids, axis=1)     
+                dists = sub_sq - 2.0 * dots + cent_sq[None, :]   
                 assign = np.argmin(dists, axis=1)
                 new_centroids = np.zeros_like(centroids)
                 counts = np.zeros((Ks,), dtype=np.int64)
@@ -171,25 +172,22 @@ class VecDB:
 
 
     def _encode_pq_codes_for_ids(self, ids: np.ndarray, codebooks: np.ndarray) -> np.ndarray:
-        """
-        Encode vectors for given ids into PQ codes (uint8).
-        Returns: codes array shape (len(ids), M), dtype=np.uint8
-        """
+        # Encode vectors with given IDs into PQ codes.
         ids = np.asarray(ids, dtype=np.int64)
         if ids.size == 0:
             return np.empty((0, codebooks.shape[0]), dtype=np.uint8)
 
-        vecs = self.get_rows_by_ids(ids)   # (len(ids), DIM)
+        vecs = self.get_rows_by_ids(ids)  
         M, Ks, subdim = codebooks.shape
         codes = np.empty((len(ids), M), dtype=np.uint8)
 
         for m in range(M):
-            sub = vecs[:, m*subdim:(m+1)*subdim]   # (len(ids), subdim)
-            cent = codebooks[m]                    # (Ks, subdim)
-            dots = sub @ cent.T                    # (len(ids), Ks)
-            sub_sq = np.sum(sub*sub, axis=1, keepdims=True)   # (len(ids),1)
-            cent_sq = np.sum(cent*cent, axis=1)               # (Ks,)
-            dists = sub_sq - 2.0 * dots + cent_sq[None, :]    # (len(ids), Ks)
+            sub = vecs[:, m*subdim:(m+1)*subdim]   
+            cent = codebooks[m]                    
+            dots = sub @ cent.T                    
+            sub_sq = np.sum(sub*sub, axis=1, keepdims=True)  
+            cent_sq = np.sum(cent*cent, axis=1)              
+            dists = sub_sq - 2.0 * dots + cent_sq[None, :]   
             assign = np.argmin(dists, axis=1)
             codes[:, m] = assign.astype(np.uint8)
         return codes
@@ -200,8 +198,8 @@ class VecDB:
             nprobe = 2
             rerank_k = 70
         else:
-            nprobe = 99
-            rerank_k = 1300
+            nprobe = 2
+            rerank_k = 700
         index_dir = self.index_path
         centroids = np.load(os.path.join(index_dir, "centroids.npy"))
         pq_dir = os.path.join(index_dir, "pq")
@@ -326,9 +324,7 @@ class VecDB:
             arr = np.array(id_list, dtype=np.uint32)
             np.save(os.path.join(lists_dir, f"{cid:06d}.npy"), arr)
 
-        # ------------------ PQ training & codes ------------------
-        # Tune these for your disk/index-size constraints:
-        # For 10M..20M rows, M=8 (8 bytes per vector) is typically required to fit 100-200MB indexes.
+        # Train PQ on sample vectors
         M = 8
         Ks = 256
         pq_codebooks = self._train_pq(sample_vectors, M=M, Ks=Ks, niter=12)
@@ -346,11 +342,9 @@ class VecDB:
             if ids_arr.size == 0:
                 np.save(os.path.join(codes_dir, f"{cid:06d}_codes.npy"), np.empty((0, M), dtype=np.uint8))
                 continue
-            codes = self._encode_pq_codes_for_ids(ids_arr, pq_codebooks)  # (len(ids), M)
+            codes = self._encode_pq_codes_for_ids(ids_arr, pq_codebooks) 
             np.save(os.path.join(codes_dir, f"{cid:06d}_codes.npy"), codes)
 
-        # update index path pointer
-        print(f"Index built and saved to {index_dir}")
         self.index_path = index_dir
 
 
