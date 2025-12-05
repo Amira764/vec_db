@@ -196,10 +196,10 @@ class VecDB:
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
         if (self._get_num_records() / 1_000_000) <= 10:
             nprobe = 2
-            rerank_k = 70
+            rerank_k = 200
         else:
             nprobe = 2
-            rerank_k = 700
+            rerank_k = 1000
         index_dir = self.index_path
         centroids = np.load(os.path.join(index_dir, "centroids.npy"))
         pq_dir = os.path.join(index_dir, "pq")
