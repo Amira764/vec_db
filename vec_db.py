@@ -12,7 +12,6 @@ class VecDB:
     def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index.dat", new_db = True, db_size = None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
-        # self._build_index()  # For Building indexes one time
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
